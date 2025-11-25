@@ -5,9 +5,29 @@ from flask import Flask, Response, abort
 
 app = Flask(__name__)
 
+def _load_stations() -> dict:
+    """Load station definitions without crashing the app on missing/malformed files."""
+    path = os.environ.get("STATIONS_FILE", "/data/stations.yaml")
+    try:
+        with open(path, "r") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        # Empty set keeps the app running (returns 404 for any station).
+        print(f"[restreamer] stations file not found at {path}; no stations loaded")
+        return {}
+    except Exception as e:
+        print(f"[restreamer] failed to parse stations file {path}: {e}")
+        return {}
+
+    if not isinstance(data, dict):
+        print(f"[restreamer] stations file {path} must contain a mapping; got {type(data)}")
+        return {}
+
+    return data
+
+
 # Load station definitions
-with open(os.environ.get("STATIONS_FILE", "stations.yml"), "r") as f:
-    STATIONS = yaml.safe_load(f) or {}
+STATIONS = _load_stations()
 
 # MIME types for output formats
 CTYPES = {"mp4": "audio/mp4", "mpegts": "video/MP2T", "adts": "audio/aac", "wav": "audio/wav", "flac": "audio/flac"}
