@@ -1,0 +1,19 @@
+# File: .dockerignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+dist/
+build/
+.git/
+.gitignore
+.DS_Store
+*.log
+*.swp
+*.swo
+*.tmp
+*~ 
+node_modules/
