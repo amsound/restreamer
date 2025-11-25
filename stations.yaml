@@ -1,0 +1,77 @@
+# File: stations.example.yaml
+radio_1:
+  url: "http://as-hls-uk-live.akamaized.net/pool_01505109/live/uk/bbc_radio_one/bbc_radio_one.isml/bbc_radio_one-audio=320000.norewind.m3u8"
+  fmt: "flac"
+  bits: "16"
+radio_2:
+  url: "http://as-hls-uk-live.akamaized.net/pool_74208725/live/uk/bbc_radio_two/bbc_radio_two.isml/bbc_radio_two-audio=320000.norewind.m3u8"
+  fmt: "flac"
+  bits: "16"
+radio_3:
+  url: "http://as-hls-uk-live.akamaized.net/pool_23461179/live/uk/bbc_radio_three/bbc_radio_three.isml/bbc_radio_three-audio=320000.norewind.m3u8"
+  fmt: "flac"
+  bits: "16"
+radio_3_unwind:
+  url: "http://as-hls-uk-live.akamaized.net/pool_30624046/live/uk/bbc_radio_three_unwind/bbc_radio_three_unwind.isml/bbc_radio_three_unwind-audio=320000.norewind.m3u8"
+  fmt: "flac"
+  bits: "16"
+radio_4:
+  url: "http://as-hls-uk-live.akamaized.net/pool_55057080/live/uk/bbc_radio_fourfm/bbc_radio_fourfm.isml/bbc_radio_fourfm-audio=320000.norewind.m3u8"
+  fmt: "flac"
+  bits: "16"
+radio_4_extra:
+  url: "http://as-hls-uk-live.akamaized.net/pool_26173715/live/uk/bbc_radio_four_extra/bbc_radio_four_extra.isml/bbc_radio_four_extra-audio=320000.norewind.m3u8"
+  fmt: "flac"
+  bits: "16"
+radio_6:
+  url: "http://as-hls-uk-live.akamaized.net/pool_81827798/live/uk/bbc_6music/bbc_6music.isml/bbc_6music-audio=320000.norewind.m3u8"
+  fmt: "flac"
+  bits: "16"
+radio_sussex:
+  url: "http://as-hls-uk-live.akamaized.net/pool_76643803/live/uk/bbc_radio_sussex/bbc_radio_sussex.isml/bbc_radio_sussex-audio=320000.norewind.m3u8"
+  fmt: "flac"
+  bits: "16"
+absolute:
+  url: "http://www.radiofeeds.net/playlists/bauerflash.pls?station=absoluteradiohigh-aac"
+  fmt: "flac"
+  bits: "16"
+capital:
+  url: "https://icecast.thisisdax.com/CapitalMP3.m3u"
+  fmt: "flac"
+  bits: "16"
+heart:
+  url: "http://icecast.thisisdax.com/HeartLondonMP3.m3u"
+  fmt: "flac"
+  bits: "16"
+magic:
+  url: "http://www.radiofeeds.net/playlists/bauer.pls?station=magic1054-mp3"
+  fmt: "flac"
+  bits: "16"
+radiox:
+  url: "https://media-ice.musicradio.com/RadioXLondonMP3.m3u"
+  fmt: "flac"
+  bits: "16"
+virgin:
+  url: "http://www.radiofeeds.net/playlists/virginb.pls?mp=stream"
+  fmt: "flac"
+  bits: "16"
+fip:
+  url: "https://stream.radiofrance.fr/fip/fip.m3u8?id=radiofrance"
+  fmt: "flac"
+  bits: "16"
+kcrw_e24:
+  url: "https://streams.kcrw.com/e24_aac"
+  fmt: "flac"
+  bits: "16"
+kcrw_live:
+  url: "https://streams.kcrw.com/kcrw_aac"
+  fmt: "flac"
+  bits: "16"
+classic_fm:
+   url: "https://ice-sov.musicradio.com/ClassicFMHD?hdauth=:2000000000:a290d4b39a16153061d4c743008b9fe8d424a7e5ec6469d40acf51fdcd336e80"
+   fmt: "flac"
+   bits: "16"
+nation-xmas:
+  url: "http://www.radiofeeds.net/playlists/sharptemp.pls?station=nationxmasdab-mp3"
+  fmt: "flac"
+  bits: "16"
