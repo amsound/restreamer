@@ -1,0 +1,29 @@
+# File: docker-compose.yml
+services:
+  hls2aac:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hls2aac:latest
+    container_name: hls2aac
+    init: true                      # better signal forwarding (like KillMode=control-group)
+    environment:
+      PORT: "8000"
+      STATIONS_FILE: "/data/stations.yaml"   # override if you rename
+      UA: "VLC/3.0"
+    volumes:
+      - ./stations.yaml:/data/stations.yaml:ro
+      # optional: put logs or temp here if you extend the app to write files
+      # - ./data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'       # ~ CPUQuota=200%
+          memory: 1G
