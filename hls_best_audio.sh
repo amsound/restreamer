@@ -1,16 +1,23 @@
 # File: hls_best_audio.sh
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
 URL="${1:?usage: hls_best_audio.sh <hls-master.m3u8> [out.aac]}"
 OUT="${2:-out.aac}"
 UA="${UA:-Mozilla/5.0}"
+
+# optional cookie: export COOKIE="hdnea=…"
 HDRS_CURL=(-H "User-Agent: $UA" --fail --silent --show-error --location)
 [[ -n "${COOKIE:-}" ]] && HDRS_CURL+=(-H "Cookie: $COOKIE")
+
 HDRS_FF=()
 [[ -n "${COOKIE:-}" ]] && HDRS_FF+=(-headers "Cookie: $COOKIE")
 HDRS_FF+=(-user_agent "$UA")
+
 tmpjson="$(mktemp)"
 trap 'rm -f "$tmpjson"' EXIT
+
+# --- 1) Try ffprobe (programs)
 if ffprobe -v error "${HDRS_FF[@]}" -print_format json -show_programs -show_streams -i "$URL" >"$tmpjson"; then
   if [[ -s "$tmpjson" ]]; then
     MAP_SEL="$(
@@ -27,7 +34,10 @@ for p in d.get("programs", []):
     v=max(as_int(t.get("variant_bitrate")), as_int(t.get("BANDWIDTH")))
     if v>best:
         best=v; best_prog=p.get("program_id")
-print(f"p:{best_prog}" if best_prog is not None and best>=0 else "")
+if best_prog is not None and best>=0:
+    print(f"p:{best_prog}")
+else:
+    print("")  # signal fallback
 PY
     )"
   else
@@ -36,6 +46,7 @@ PY
 else
   MAP_SEL=""
 fi
+
 if [[ -n "$MAP_SEL" ]]; then
   echo "Using ffprobe map: -map $MAP_SEL"
   exec ffmpeg -loglevel info \
@@ -45,9 +56,16 @@ if [[ -n "$MAP_SEL" ]]; then
     -map "$MAP_SEL" -map -0:d \
     -c:a copy -f adts "$OUT"
 fi
+
+# --- 2) Fallback: parse the master playlist directly, pick highest BANDWIDTH child
 echo "ffprobe produced no data; falling back to parsing master playlist…"
+
 master="$(curl "${HDRS_CURL[@]}" "$URL")"
+
+# Grab the base for resolving relative child URLs
 base="${URL%/*}"
+
+# Parse EXT-X-STREAM-INF blocks: take highest BANDWIDTH and remember the following non-comment line
 readarray -t lines <<<"$master"
 best_bw=0
 best_child=""
@@ -55,15 +73,18 @@ prev_bw=0
 for ((i=0; i<${#lines[@]}; i++)); do
   line="${lines[$i]}"
   if [[ "$line" =~ ^#EXT-X-STREAM-INF ]]; then
+    # extract BANDWIDTH=
     if [[ "$line" =~ BANDWIDTH=([0-9]+) ]]; then
       prev_bw="${BASH_REMATCH[1]}"
     else
       prev_bw=0
     fi
+    # look ahead for the next non-comment, non-empty line (child playlist URL)
     j=$((i+1))
     while (( j<${#lines[@]} )); do
       n="${lines[$j]}"
       if [[ -n "$n" && ! "$n" =~ ^# ]]; then
+        # resolve relative vs absolute
         if [[ "$n" =~ ^https?:// ]]; then child="$n"; else child="$base/$n"; fi
         if (( prev_bw > best_bw )); then
           best_bw="$prev_bw"; best_child="$child"
@@ -74,11 +95,15 @@ for ((i=0; i<${#lines[@]}; i++)); do
     done
   fi
 done
+
 if [[ -z "$best_child" ]]; then
   echo "Could not find any child playlists in master; aborting." >&2
   exit 3
 fi
+
 echo "Chose child playlist: $best_child (BANDWIDTH=$best_bw)"
+
+# Now stream from the chosen child; simplest is map the only audio and drop data
 exec ffmpeg -loglevel info \
   "${HDRS_FF[@]}" \
   -rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_delay_max 5 \
