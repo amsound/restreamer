@@ -1,13 +1,84 @@
-# File: README.md
-# hls2aac – Dockerized
-## Build
+# restreamer
+
+Turns any radio source into one steady, never-ending HTTP stream in a format
+you choose, so a speaker only ever sees one simple kind of stream.
+
+Sources: Icecast/Shoutcast, PLS and M3U playlists, HLS (picks the best variant),
+and TuneIn stations (resolved fresh on every connect, so signed URLs never go stale).
+
+If the source drops, a signed URL expires or ffmpeg exits, the restreamer
+re-resolves the source and restarts ffmpeg **inside the same response**. The
+player keeps its connection and at most hears a short gap.
+
+## Build and run
+
+```bash
 docker compose build
-## Run (mount your config)
-# Place `stations.yaml` next to docker-compose.yml
-docker compose up
-## Test
-# Stream one station (adts/flac/mp4/mpegts depend on your YAML)
-curl -v http://localhost:8000/s/radio_3 > /dev/null
-## Notes
-- Change user agent via `UA` env if a provider is picky.
-- `STATIONS_FILE` defaults to `/data/stations.yaml`; override in compose if needed.
+docker compose up -d
+```
+
+`stations.yaml` sits next to `docker-compose.yaml` and is mounted read-only.
+
+## Endpoints
+
+| URL | What it does |
+|---|---|
+| `/s/<name>` | A station from `stations.yaml` |
+| `/play?src=<source>&fmt=<fmt>` | Any source, no config needed |
+| `/health` | Liveness check (used by the Docker healthcheck) |
+
+`src` can be a stream URL, `tunein:s345724`, a bare `s345724`, or a
+`tunein.com` station URL. URL-encode it when it contains `?` or `&`.
+
+```bash
+curl -v http://localhost:8000/s/apple_music_hits > /dev/null
+curl -v "http://localhost:8000/play?src=tunein:s345724&fmt=flac" > /dev/null
+```
+
+## Formats
+
+| `fmt` | Output | Notes |
+|---|---|---|
+| `adts` | AAC, untouched | Codec, bitrate and sample rate passed straight through. AAC sources only; an MP3 source is refused with a clear log line. |
+| `flac` | FLAC | Decoded and re-encoded, so every station comes out the same. `bits: 16` or `24`. |
+| `wav` | PCM WAV | As `flac`, uncompressed. |
+| `mpegts`, `mp4` | AAC in TS / fragmented MP4 | Copy formats, as `adts`. |
+
+`flac` and `wav` pass the source sample rate through unless you set `rate`, and
+output stereo unless you set `channels: 1`. They run as two ffmpeg processes: a
+restartable decoder feeding one long-lived encoder, so a source restart never
+sends the player a second stream header.
+
+## Settings
+
+Per station (or as `/play` query parameters): `fmt`, `bits`, `rate`, `channels`.
+
+Environment:
+
+| Variable | Default | |
+|---|---|---|
+| `DEFAULT_FMT` | `adts` | Format when a station doesn't set one |
+| `THREADS` | `8` | Maximum simultaneous listeners |
+| `UA` | `VLC/3.0` | User agent sent upstream |
+| `STATIONS_FILE` | `/data/stations.yaml` | |
+| `LOG_LEVEL` | `INFO` | |
+
+## Logs
+
+Each connection gets an ID, and the log shows the resolved source (signatures
+stripped), the output format, every restart with ffmpeg's reason, and the
+disconnect:
+
+```
+[apple_music_hits #1 ← 192.168.70.51] connected fmt=adts
+[apple_music_hits #1 ← 192.168.70.51] source https://itsliveradio.apple.com/.../usw/256.m3u8 (copy → adts)
+```
+
+## hls_best_audio.sh
+
+A standalone debugging tool, also available inside the container: saves the
+best audio variant of an HLS stream to a file.
+
+```bash
+docker compose exec hls2aac ./hls_best_audio.sh "<master.m3u8>" /tmp/out.aac
+```

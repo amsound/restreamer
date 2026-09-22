@@ -1,4 +1,11 @@
 # File: stations.example.yaml
+# url:  any stream URL (Icecast, PLS, M3U, HLS) or a TuneIn station
+#       ("tunein:s345724", "s345724" or a tunein.com station URL)
+# fmt:  adts (AAC passed through untouched; AAC sources only), flac or wav
+# bits: 16 or 24 (flac/wav)   rate: e.g. 48000 (default: source rate)
+apple_music_hits:
+  url: "tunein:s345724"
+  fmt: "adts"
 radio_1:
   url: "http://as-hls-uk-live.akamaized.net/pool_01505109/live/uk/bbc_radio_one/bbc_radio_one.isml/bbc_radio_one-audio=320000.norewind.m3u8"
   fmt: "flac"

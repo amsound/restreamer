@@ -8,7 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=8000 \
     STATIONS_FILE=/data/stations.yaml \
-    UA="VLC/3.0"
+    UA="VLC/3.0" \
+    DEFAULT_FMT=adts
 
 # FFmpeg + certs
 RUN apt-get update \
@@ -24,7 +25,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 # App
-COPY app.py hls_best_audio.sh ./
+COPY app.py gunicorn.conf.py hls_best_audio.sh ./
 RUN chmod +x hls_best_audio.sh \
  && mkdir -p /data \
  && chown -R appuser:appuser /app /data
@@ -32,8 +33,8 @@ RUN chmod +x hls_best_audio.sh \
 EXPOSE 8000
 USER appuser
 
-# Portable shell-form CMD (env expansion works; single line avoids parser issues)
-CMD gunicorn -w 1 --threads 4 --worker-class gthread \
-    --timeout 0 --graceful-timeout 10 \
-    --max-requests 1000 --max-requests-jitter 100 \
-    --bind 0.0.0.0:${PORT:-8000} app:app
+HEALTHCHECK --interval=60s --timeout=5s --start-period=10s \
+  CMD curl -fsS "http://127.0.0.1:${PORT:-8000}/health" || exit 1
+
+# All server settings live in gunicorn.conf.py.
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "app:app"]

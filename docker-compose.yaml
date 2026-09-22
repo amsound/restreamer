@@ -9,6 +9,7 @@ services:
       PORT: "8000"
       STATIONS_FILE: "/data/stations.yaml"
       UA: "VLC/3.0"
+      DEFAULT_FMT: "adts"             # adts (AAC copy), flac or wav
     volumes:
       - ./stations.yaml:/data/stations.yaml:ro
     ports:
