@@ -1,9 +1,13 @@
 """Restream any radio source (Icecast, PLS/M3U, HLS, TuneIn) as one steady HTTP stream.
 
-Players get a single, never-ending response in a consistent format, no matter
-how the station publishes. Upstream trouble (expired signed URLs, dropped
-connections, ffmpeg exits) is handled here by re-resolving the source and
-restarting ffmpeg inside the same response, so the player never sees it.
+Players get what a plain Icecast server would give them: an HTTP/1.0 response
+with a raw, never-ending body (no length, no chunking), delivered at real-time
+speed after a short start-up burst. However the station publishes, even HLS
+that arrives in large segments, the player sees one steady radio stream.
+
+Upstream trouble (expired signed URLs, dropped connections, ffmpeg exits) is
+handled here by re-resolving the source and restarting ffmpeg inside the same
+response, so the player never sees it.
 
 Endpoints:
   GET /s/<name>                      station from stations.yaml
@@ -12,21 +16,21 @@ Endpoints:
 """
 
 import contextlib
+import json
 import logging
 import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 import yaml
-from flask import Flask, Response, abort, request
-
-app = Flask(__name__)
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -76,14 +80,19 @@ CTYPES = {
 }
 
 DEFAULT_FMT = os.environ.get("DEFAULT_FMT", "adts").lower()
+# Seconds of audio sent straight away on connect; after that, real time. Like
+# Icecast's burst-on-connect: enough for the player to start promptly without
+# handing it a large backlog.
+BURST_SECONDS = float(os.environ.get("BURST_SECONDS", "4"))
 UA = os.environ.get("UA", "VLC/3.0")
 HTTP_TIMEOUT = (3, 10)  # (connect, read) seconds
 HLS_RE = re.compile(r"\.m3u8($|\?)", re.I)
 HDNEA_RE = re.compile(r"(?i)\bhdnea=[^;]+")
 
-# Restart policy: back off between attempts, and give up only after repeated
-# attempts that never produced audio.
-RESTART_BACKOFF_S = (1, 2, 4, 8, 10)
+# Restart policy: after a healthy run, restart at once (the player only holds
+# a few seconds of audio); back off only across repeated failures, and give
+# up after repeated attempts that never produced audio.
+RESTART_BACKOFF_S = (0, 1, 2, 4, 8, 10)
 MAX_FAILED_STARTS = 5
 HEALTHY_AFTER_S = 30  # a run this long resets the failure count
 
@@ -335,6 +344,11 @@ def _input_args(url: str, extra: list[str], *, probe_fast: bool) -> list[str]:
         "-headers", "Icy-MetaData: 1",
         *extra,
         *probe,
+        # Deliver like a radio server: a short burst, then exactly real time,
+        # rather than passing on whatever arrives (HLS comes a whole segment
+        # at once).
+        "-readrate", "1",
+        "-readrate_initial_burst", f"{BURST_SECONDS:g}",
         "-fflags", "+nobuffer",
         "-rw_timeout", "15000000",
         "-reconnect", "1",
@@ -533,7 +547,8 @@ class Restarter:
         delay = RESTART_BACKOFF_S[min(self.failed_starts, len(RESTART_BACKOFF_S) - 1)]
         self.restarts += 1
         log.info("%s restarting source in %ss (restart #%d)", self.label, delay, self.restarts)
-        stop.wait(delay)
+        if delay:
+            stop.wait(delay)
 
 
 CHUNK = 64 * 1024
@@ -688,10 +703,14 @@ def stream_encoded(spec: StreamSpec, label: str):
 
 
 # ---------- HTTP ----------
-def _spec_from(name: str, src: str, opts) -> StreamSpec:
+class BadRequest(ValueError):
+    """A request we refuse with 400."""
+
+
+def _spec_from(name: str, src: str, opts: dict) -> StreamSpec:
     fmt = str(opts.get("fmt") or DEFAULT_FMT).lower()
     if fmt not in COPY_FORMATS | ENCODED_FORMATS:
-        abort(400, description=f"unsupported fmt {fmt!r}")
+        raise BadRequest(f"unsupported fmt {fmt!r}")
 
     def as_int(key: str, default, allowed=None):
         raw = opts.get(key)
@@ -700,9 +719,9 @@ def _spec_from(name: str, src: str, opts) -> StreamSpec:
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            abort(400, description=f"{key} must be a number")
+            raise BadRequest(f"{key} must be a number")
         if allowed and value not in allowed:
-            abort(400, description=f"{key} must be one of {sorted(allowed)}")
+            raise BadRequest(f"{key} must be one of {sorted(allowed)}")
         return value
 
     return StreamSpec(
@@ -719,50 +738,105 @@ _conn_ids = iter(range(1, 1 << 62))
 _conn_lock = threading.Lock()
 
 
-def _serve(spec: StreamSpec) -> Response:
-    client = request.headers.get("X-Forwarded-For", request.remote_addr)
-    with _conn_lock:
-        conn = next(_conn_ids)
-    label = f"[{spec.name} #{conn} ← {client}]"
-    log.info("%s connected fmt=%s", label, spec.fmt)
-    started = time.time()
+class Handler(BaseHTTPRequestHandler):
+    """Answers the way a plain Icecast server does.
 
-    gen = stream_copy(spec, label) if spec.fmt in COPY_FORMATS else stream_encoded(spec, label)
+    HTTP/1.0, no Content-Length, no chunked encoding: the body is the stream
+    itself and ends when the connection closes.
+    """
 
-    def body():
+    protocol_version = "HTTP/1.0"
+
+    def version_string(self) -> str:
+        return "restreamer"
+
+    def do_GET(self) -> None:
+        url = urlparse(self.path)
         try:
-            yield from gen
+            if url.path == "/health":
+                return self._send_json(200, {"ok": True, "stations": len(STATIONS)})
+
+            if url.path.startswith("/s/"):
+                name = unquote(url.path[len("/s/"):])
+                station = STATIONS.get(name)
+                if not station or not station.get("url"):
+                    return self._send_json(404, {"error": f"unknown station {name!r}"})
+                return self._stream(_spec_from(name, str(station["url"]), station))
+
+            if url.path == "/play":
+                query = {k: v[-1] for k, v in parse_qs(url.query).items()}
+                src = (query.get("src") or "").strip()
+                if not src:
+                    raise BadRequest("src is required (a URL or TuneIn station ID)")
+                name = tunein_station_id(src) or urlparse(src).hostname or "stream"
+                return self._stream(_spec_from(name, src, query))
+
+            self._send_json(404, {"error": "not found"})
+        except BadRequest as e:
+            self._send_json(400, {"error": str(e)})
+
+    def _send_json(self, status: int, body: dict) -> None:
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _stream(self, spec: StreamSpec) -> None:
+        client = self.headers.get("X-Forwarded-For") or self.client_address[0]
+        with _conn_lock:
+            conn = next(_conn_ids)
+        label = f"[{spec.name} #{conn} ← {client}]"
+        log.info("%s connected fmt=%s", label, spec.fmt)
+        started = time.time()
+
+        self.send_response(200)
+        self.send_header("Content-Type", CTYPES[spec.fmt])
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("icy-name", spec.name)
+        self.send_header("icy-pub", "0")
+        self.end_headers()
+
+        gen = stream_copy(spec, label) if spec.fmt in COPY_FORMATS else stream_encoded(spec, label)
+        try:
+            for chunk in gen:
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass  # the player went away
         finally:
             gen.close()
             log.info("%s disconnected after %.0fs", label, time.time() - started)
 
-    # No Content-Length: this stream never ends, and some Cast receivers
-    # (Samsung) drop streams that claim a length.
-    headers = {"Cache-Control": "no-store, max-age=0", "icy-name": spec.name}
-    return Response(body(), mimetype=CTYPES[spec.fmt], headers=headers)
+    def log_message(self, fmt: str, *args) -> None:
+        # Streams log their own connect/disconnect; skip the per-minute healthcheck.
+        if not self.path.startswith("/health"):
+            log.debug("%s %s", self.address_string(), fmt % args)
 
 
-@app.route("/s/<name>")
-def serve(name: str):
-    spec = STATIONS.get(name)
-    if not spec or not spec.get("url"):
-        abort(404)
-    return _serve(_spec_from(name, str(spec["url"]), spec))
+class Server(ThreadingHTTPServer):
+    daemon_threads = True  # don't hold shutdown for open streams
+    allow_reuse_address = True
 
 
-@app.route("/play")
-def play():
-    src = (request.args.get("src") or "").strip()
-    if not src:
-        abort(400, description="src is required (a URL or TuneIn station ID)")
-    name = tunein_station_id(src) or urlparse(src).hostname or "stream"
-    return _serve(_spec_from(name, src, request.args))
+def main() -> None:
+    port = int(os.environ.get("PORT", "8000"))
+    server = Server(("0.0.0.0", port), Handler)
 
+    def stop(*_):
+        # shutdown() waits for serve_forever, so it must run off the main thread.
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
-@app.route("/health")
-def health():
-    return {"ok": True, "stations": len(STATIONS)}
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    log.info(
+        "listening on :%d (default fmt %s, %gs burst then real time, %d stations)",
+        port, DEFAULT_FMT, BURST_SECONDS, len(STATIONS),
+    )
+    server.serve_forever()
+    server.server_close()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), threaded=True)
+    main()

@@ -9,7 +9,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8000 \
     STATIONS_FILE=/data/stations.yaml \
     UA="VLC/3.0" \
-    DEFAULT_FMT=adts
+    DEFAULT_FMT=adts \
+    BURST_SECONDS=4
 
 # FFmpeg + certs
 RUN apt-get update \
@@ -25,7 +26,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 # App
-COPY app.py gunicorn.conf.py hls_best_audio.sh ./
+COPY app.py hls_best_audio.sh ./
 RUN chmod +x hls_best_audio.sh \
  && mkdir -p /data \
  && chown -R appuser:appuser /app /data
@@ -36,5 +37,4 @@ USER appuser
 HEALTHCHECK --interval=60s --timeout=5s --start-period=10s \
   CMD curl -fsS "http://127.0.0.1:${PORT:-8000}/health" || exit 1
 
-# All server settings live in gunicorn.conf.py.
-CMD ["gunicorn", "-c", "gunicorn.conf.py", "app:app"]
+CMD ["python", "app.py"]

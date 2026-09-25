@@ -3,6 +3,12 @@
 Turns any radio source into one steady, never-ending HTTP stream in a format
 you choose, so a speaker only ever sees one simple kind of stream.
 
+The stream looks exactly like a plain Icecast server: an `HTTP/1.0` response
+with a raw body (no `Content-Length`, no chunked encoding), a few seconds of
+audio up front and then real time. Even HLS, which arrives a whole segment at a
+time, reaches the player as a steady trickle. Basic players, such as the Cast
+receiver in Samsung soundbars, cope with this best.
+
 Sources: Icecast/Shoutcast, PLS and M3U playlists, HLS (picks the best variant),
 and TuneIn stations (resolved fresh on every connect, so signed URLs never go stale).
 
@@ -58,7 +64,7 @@ Environment:
 | Variable | Default | |
 |---|---|---|
 | `DEFAULT_FMT` | `adts` | Format when a station doesn't set one |
-| `THREADS` | `8` | Maximum simultaneous listeners |
+| `BURST_SECONDS` | `4` | Audio sent at once on connect; after that, real time. Raise it if a player needs a bigger buffer. |
 | `UA` | `VLC/3.0` | User agent sent upstream |
 | `STATIONS_FILE` | `/data/stations.yaml` | |
 | `LOG_LEVEL` | `INFO` | |
