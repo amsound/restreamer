@@ -68,7 +68,7 @@ STATIONS = _load_stations()
 COPY_FORMATS = {"adts", "mpegts", "mp4"}
 # Encoded formats decode the source and re-encode it, so every station comes
 # out identical regardless of what it publishes.
-ENCODED_FORMATS = {"flac", "wav"}
+ENCODED_FORMATS = {"flac", "wav", "mp3"}
 
 # MIME types for output formats
 CTYPES = {
@@ -77,6 +77,7 @@ CTYPES = {
     "adts": "audio/aac",
     "wav": "audio/wav",
     "flac": "audio/flac",
+    "mp3": "audio/mpeg",
 }
 
 DEFAULT_FMT = os.environ.get("DEFAULT_FMT", "adts").lower()
@@ -417,6 +418,11 @@ def decode_cmd(url: str, extra: list[str], *, bits: int, channels: int, rate: in
     return args + ["-c:a", f"pcm_{fmt}", "-f", fmt, "-"]
 
 
+# MP3 at 320 kbps exists only at these sample rates (MPEG-1 Layer III).
+MP3_RATES = {32000, 44100, 48000}
+MP3_BITRATE = "320k"
+
+
 def encode_cmd(pcm: PcmFormat, fmt: str) -> list[str]:
     """Encoder: raw PCM on stdin → one continuous output stream. Lives for the whole session."""
     base = [
@@ -427,6 +433,18 @@ def encode_cmd(pcm: PcmFormat, fmt: str) -> list[str]:
     if fmt == "wav":
         codec = "pcm_s16le" if pcm.bits == 16 else "pcm_s24le"
         return base + ["-c:a", codec, "-flush_packets", "1", "-f", "wav", "-"]
+
+    if fmt == "mp3":
+        # CBR, and no Xing/Info or ID3 header: in a live stream those describe
+        # a "file" of zero length, which some players take literally.
+        args = [
+            "-c:a", "libmp3lame", "-b:a", MP3_BITRATE,
+            "-write_xing", "0", "-id3v2_version", "0",
+            "-flush_packets", "1",
+        ]
+        if pcm.rate not in MP3_RATES:
+            args += ["-ar", "48000"]
+        return base + args + ["-f", "mp3", "-"]
 
     # flac
     args = ["-c:a", "flac", "-compression_level", "5", "-flush_packets", "1"]

@@ -7,7 +7,7 @@ services:
   environment:
     PORT: "8000"
     STATIONS_FILE: "/data/stations.yaml"
-    DEFAULT_FMT: "adts"             # adts (AAC copy), flac or wav
+    DEFAULT_FMT: "adts"             # adts (AAC copy), mp3 (320k), flac or wav
     BURST_SECONDS: "4"              # audio sent at once on connect, then real time
     volumes:
       - ./stations.yaml:/data/stations.yaml:ro

@@ -47,10 +47,11 @@ curl -v "http://localhost:8000/play?src=tunein:s345724&fmt=flac" > /dev/null
 |---|---|---|
 | `adts` | AAC, untouched | Codec, bitrate and sample rate passed straight through. AAC sources only; an MP3 source is refused with a clear log line. |
 | `flac` | FLAC | Decoded and re-encoded, so every station comes out the same. `bits: 16` or `24`. |
+| `mp3` | MP3, 320 kbps CBR | Decoded and re-encoded like `flac`. The most widely supported format; the choice for fussy players. |
 | `wav` | PCM WAV | As `flac`, uncompressed. |
 | `mpegts`, `mp4` | AAC in TS / fragmented MP4 | Copy formats, as `adts`. |
 
-`flac` and `wav` pass the source sample rate through unless you set `rate`, and
+`flac`, `mp3` and `wav` pass the source sample rate through (MP3: 32, 44.1 or 48 kHz, otherwise resampled to 48 kHz) unless you set `rate`, and
 output stereo unless you set `channels: 1`. They run as two ffmpeg processes: a
 restartable decoder feeding one long-lived encoder, so a source restart never
 sends the player a second stream header.
