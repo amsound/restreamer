@@ -18,10 +18,14 @@ player keeps its connection and at most hears a short gap.
 
 ## Build and run
 
+GitHub Actions (`.github/workflows/image.yml`) builds the arm64 image on every push to `main` that touches
+the code, and publishes it to `ghcr.io/amsound/restreamer`: `:latest`, plus `:sha-<commit>` for rolling back.
+
 ```bash
-docker compose build
-docker compose up -d
+docker compose pull && docker compose up -d
 ```
+
+Build locally instead with `docker build -t ghcr.io/amsound/restreamer:latest .`.
 
 `stations.yaml` sits next to `docker-compose.yaml` and is mounted read-only.
 
@@ -45,7 +49,7 @@ curl -v "http://localhost:8000/play?src=tunein:s345724&fmt=flac" > /dev/null
 
 | `fmt` | Output | Notes |
 |---|---|---|
-| `adts` | AAC, untouched | Codec, bitrate and sample rate passed straight through. AAC sources only; an MP3 source is refused with a clear log line. |
+| `adts` | AAC, untouched | Codec, bitrate and sample rate passed straight through, whole frames only (a frame cut by a source restart is dropped). AAC sources only; an MP3 source is refused with a clear log line. |
 | `flac` | FLAC | Decoded and re-encoded, so every station comes out the same. `bits: 16` or `24`. |
 | `mp3` | MP3, 320 kbps CBR | Decoded and re-encoded like `flac`. The most widely supported format; the choice for fussy players. |
 | `wav` | PCM WAV | As `flac`, uncompressed. |

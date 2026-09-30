@@ -1,16 +1,17 @@
-# File: docker-compose.yml
+# File: docker-compose.yaml
 services:
   restreamer:
-  image: a1exm/restreamer:latest
-  container_name: restreamer
-  init: true                      # better signal forwarding (like KillMode=control-group)
-  environment:
-    PORT: "8000"
-    STATIONS_FILE: "/data/stations.yaml"
-    DEFAULT_FMT: "adts"             # adts (AAC copy), mp3 (320k), flac or wav
-    BURST_SECONDS: "4"              # audio sent at once on connect, then real time
+    image: ghcr.io/amsound/restreamer:latest
+    container_name: restreamer
+    init: true                      # better signal forwarding
+    environment:
+      PORT: "8000"
+      STATIONS_FILE: "/data/stations.yaml"
+      DEFAULT_FMT: "adts"           # adts (AAC copy), mp3 (320k), flac or wav
+      BURST_SECONDS: "15"           # audio sent at once on connect (the player's safety margin), then real time
     volumes:
       - ./stations.yaml:/data/stations.yaml:ro
+      - /etc/localtime:/etc/localtime:ro
     ports:
       - "8000:8000"
     restart: unless-stopped

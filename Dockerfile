@@ -27,7 +27,9 @@ RUN pip install -r requirements.txt
 
 # App
 COPY app.py hls_best_audio.sh ./
-RUN chmod +x hls_best_audio.sh \
+# Logged at startup, to tell which build is running.
+RUN date -u +"%Y-%m-%d %H:%M UTC" > /app/BUILD_DATE \
+ && chmod +x hls_best_audio.sh \
  && mkdir -p /data \
  && chown -R appuser:appuser /app /data
 

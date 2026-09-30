@@ -572,11 +572,63 @@ class Restarter:
 CHUNK = 64 * 1024
 
 
+class AdtsFramer:
+    """Pass on whole ADTS (AAC) frames only.
+
+    ffmpeg writes whole frames while it runs, but a source restart can leave a
+    cut frame at the seam. A player's decoder can choke on that, so a frame is
+    only sent once all of it has arrived, and a cut one is dropped. Anything
+    that isn't a frame is skipped up to the next valid header.
+    """
+
+    HEADER = 7
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self.skipped = 0
+
+    @staticmethod
+    def _frame_len(b: bytearray, i: int) -> int:
+        """Frame length if a valid ADTS header starts at i, else 0."""
+        if b[i] != 0xFF or (b[i + 1] & 0xF6) != 0xF0:  # 12-bit sync, layer 00
+            return 0
+        if (b[i + 2] >> 2) & 0x0F > 12:  # sampling-frequency index out of range
+            return 0
+        length = ((b[i + 3] & 0x03) << 11) | (b[i + 4] << 3) | (b[i + 5] >> 5)
+        return length if length >= AdtsFramer.HEADER else 0
+
+    def feed(self, data: bytes) -> bytes:
+        buf = self._buf
+        buf += data
+        out = bytearray()
+        i, n = 0, len(buf)
+        while n - i >= self.HEADER:
+            length = self._frame_len(buf, i)
+            if not length:
+                i += 1
+                self.skipped += 1
+                continue
+            if n - i < length:
+                break  # rest of this frame hasn't arrived yet
+            out += buf[i:i + length]
+            i += length
+        del buf[:i]
+        return bytes(out)
+
+    def drop_partial(self) -> int:
+        """Discard an incomplete trailing frame (at a source restart). Returns bytes dropped."""
+        dropped = len(self._buf)
+        self.skipped += dropped
+        self._buf.clear()
+        return dropped
+
+
 def stream_copy(spec: StreamSpec, label: str):
     """Yield the source's own audio, restarting ffmpeg in place when it exits."""
     stop = threading.Event()
     restarter = Restarter(label)
     proc: FFmpegProc | None = None
+    framer = AdtsFramer() if spec.fmt == "adts" else None
     try:
         while not stop.is_set():
             try:
@@ -596,9 +648,17 @@ def stream_copy(spec: StreamSpec, label: str):
                 if not chunk:
                     break
                 produced = True
+                if framer is not None:
+                    chunk = framer.feed(chunk)
+                    if not chunk:
+                        continue
                 yield chunk
 
             proc.stop()
+            if framer is not None:
+                dropped = framer.drop_partial()
+                if dropped:
+                    log.info("%s dropped a cut frame (%d bytes) at the source seam", label, dropped)
             ran_for = time.time() - proc.started
             if not produced and spec.fmt in ("adts", "mp4") and proc.input_codec not in (None, "aac"):
                 log.error(
@@ -848,9 +908,14 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    try:
+        with open("/app/BUILD_DATE") as f:
+            built = f.read().strip() or "unknown"
+    except OSError:
+        built = "unknown"
     log.info(
-        "listening on :%d (default fmt %s, %gs burst then real time, %d stations)",
-        port, DEFAULT_FMT, BURST_SECONDS, len(STATIONS),
+        "listening on :%d (built %s, default fmt %s, %gs burst then real time, %d stations)",
+        port, built, DEFAULT_FMT, BURST_SECONDS, len(STATIONS),
     )
     server.serve_forever()
     server.server_close()
