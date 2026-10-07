@@ -11,6 +11,7 @@ services:
       BURST_SECONDS: "15"           # audio sent at once on connect (the player's safety margin), then real time
     volumes:
       - ./stations.yaml:/data/stations.yaml:ro
+      - ./restreamer-data:/data/captures   # each listener's last audio and report; must belong to user 10001
       - /etc/localtime:/etc/localtime:ro
     ports:
       - "8000:8000"
