@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import socket
 import struct
@@ -33,7 +34,7 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlsplit
 
 import requests
 import yaml
@@ -92,6 +93,7 @@ DEFAULT_FMT = os.environ.get("DEFAULT_FMT", "adts").lower()
 # handing it a large backlog.
 BURST_SECONDS = float(os.environ.get("BURST_SECONDS", "4"))
 UA = os.environ.get("UA", "VLC/3.0")
+PORT = int(os.environ.get("PORT", "8000"))
 HTTP_TIMEOUT = (3, 10)  # (connect, read) seconds
 HLS_RE = re.compile(r"\.m3u8($|\?)", re.I)
 HDNEA_RE = re.compile(r"(?i)\bhdnea=[^;]+")
@@ -336,6 +338,326 @@ def _redact(url: str) -> str:
     return url.split("?", 1)[0]
 
 
+# ---------- stable local HLS origin ----------
+# A station's signed playlist address runs out (Apple's after six hours), and
+# ffmpeg cannot swap the address it was started on, so a direct HLS stream
+# restarts every six hours: a fresh ffmpeg joins the station again and sends a
+# fresh burst, which the player hears as a jump and keeps as extra buffer.
+#
+# So an HLS source is served to ffmpeg from a local address that never runs out.
+# ffmpeg polls this process for the playlist; each time, the station's current
+# playlist is fetched, its segment lines pointed back here, and the segments
+# passed through. When the signature runs out, the station is looked up afresh
+# behind the same local address. Stations number their segments continuously
+# whichever signature fetched them, so ffmpeg sees one unbroken live stream and
+# never has to restart.
+#
+# Only HLS sources (TuneIn stations and .m3u8 addresses) go this way; everything
+# else is handed to ffmpeg directly, as before. If the origin fails outright,
+# ffmpeg exits and the stream restarts the old way.
+HLS_ORIGIN = os.environ.get("HLS_ORIGIN", "1").strip().lower() not in ("0", "false", "no", "off")
+HLS_ORIGIN_PATH = "/_hls"
+ORIGIN_FETCH_TIMEOUT = (4, 10)   # (connect, read) seconds
+ORIGIN_SEGMENTS_KEPT = 128       # names remembered; a live playlist lists about ten
+# Apple's segment signatures all run out together on a six-hourly boundary
+# (01:00, 07:00, 13:00, 19:00 UK), answered with 403 or 433, and until the
+# station next updates its playlist even a fresh look-up still lists the old
+# signatures: 6 s at 01:00 and 12-15 s at 07:00 when measured on 8 Oct 2026, so
+# up to one 16 s segment. So a refused segment gets one fresh look-up and then
+# the playlist is read again every RESIGN_POLL_S until the segment comes back
+# freshly signed. The read-ahead does that in the background, where it can wait
+# a full cycle and more; a segment ffmpeg is itself waiting for is given up a
+# little before ffmpeg's own 15 s limit (-rw_timeout), so it gets an answer.
+ORIGIN_RESIGN_WAIT_S = 24.0
+ORIGIN_INLINE_WAIT_S = 13.0
+ORIGIN_RESIGN_POLL_S = 2.0
+_ORIGIN_URI_RE = re.compile(r'(URI=")([^"]+)(")')
+
+
+def _wants_origin(src: str) -> bool:
+    """TuneIn stations are the ones served behind signatures that run out."""
+    return HLS_ORIGIN and bool(tunein_station_id(src))
+
+
+def _refused(status: int) -> bool:
+    """A 4xx that means the address itself is turned down (signatures end this way: Apple uses 403 and 433)."""
+    return 400 <= status < 500 and status not in (404, 408, 429)
+
+
+class HlsOrigin:
+    """One listener's HLS source, served to its ffmpeg from a local address that never runs out.
+
+    A background thread keeps the next few segments in hand ahead of what ffmpeg
+    has asked for, as a player's own buffer would. ffmpeg only fetches a segment
+    as it needs it, so without this any slow or refused fetch (the six-hourly
+    re-signing) would pause its output; with it, those are dealt with in the
+    background and ffmpeg's requests are answered from memory.
+    """
+
+    PREFETCH_AHEAD = 3   # segments kept in hand ahead of ffmpeg: about 48 s of Apple's station
+    CACHE_MAX = 8
+    # The playlist is also read here this often (once ffmpeg has started), so a new segment
+    # is fetched the moment the station publishes it rather than when ffmpeg next looks.
+    PLAYLIST_REFRESH_S = 2.0
+
+    def __init__(self, token: str, src: str, label: str) -> None:
+        self.token = token
+        self._src = src
+        self.label = label
+        self._lock = threading.Lock()          # the state below; never held across a network fetch
+        self._lookup_lock = threading.Lock()   # one look-up at a time
+        self._generation = 0                   # goes up with every look-up
+        self._session = requests.Session()
+        self._session.headers["User-Agent"] = UA
+        self._media_url: str | None = None
+        self._rendition: str | None = None
+        self._segments: collections.OrderedDict[str, str] = collections.OrderedDict()   # local name -> current address
+        self._order: list[str] = []      # media segments in the latest playlist, in order
+        self._listed: set[str] = set()   # every name in the latest playlist (opening segment too)
+        self._cache: collections.OrderedDict[str, bytes] = collections.OrderedDict()
+        # Opening segments never change for a given name, and ffmpeg asks for one again after
+        # every playlist reload, so they are kept for good and answered from memory.
+        self._maps: set[str] = set()
+        self._map_cache: dict[str, bytes] = {}
+        self._seq_names: collections.OrderedDict[int, str] = collections.OrderedDict()   # media sequence -> name
+        self._seq_warned = -1   # look-up generation already warned about
+        self._first_seq = -1    # the latest playlist's first sequence number
+        self._last_asked: str | None = None
+        self._wake = threading.Event()
+        self._closed = False
+        self.lookups = 0
+        threading.Thread(target=self._prefetch_loop, daemon=True, name=f"origin:{token}").start()
+
+    def prepare(self) -> bool:
+        """Look the station up now. True if it is HLS (and so worth serving from here)."""
+        self._look_up(self._generation)
+        return bool(HLS_RE.search(self._media_url or ""))
+
+    @property
+    def playlist_url(self) -> str:
+        return f"http://127.0.0.1:{PORT}{HLS_ORIGIN_PATH}/{self.token}/index.m3u8"
+
+    def close(self) -> None:
+        self._closed = True
+        self._wake.set()
+        with contextlib.suppress(Exception):
+            self._session.close()
+
+    # ---- the station ----
+
+    def _look_up(self, seen: int) -> None:
+        """Ask for the station's current, freshly signed media playlist address (unless another thread just did)."""
+        with self._lookup_lock:
+            if self._generation != seen:
+                return
+            url, extra = resolve_source(self._src)
+            for i, arg in enumerate(extra):   # a cookie choose_hls_best found goes on our requests instead
+                if arg == "-headers" and i + 1 < len(extra) and extra[i + 1].lower().startswith("cookie:"):
+                    self._session.headers["Cookie"] = extra[i + 1].split(":", 1)[1].strip()
+            with self._lock:
+                if self._rendition and _redact(url) != self._rendition:
+                    log.warning("%s station moved to another rendition: %s -> %s", self.label, self._rendition, _redact(url))
+                self._rendition = _redact(url)
+                self._media_url = url
+                self._generation += 1
+                self.lookups += 1
+                lookups = self.lookups
+        if lookups == 1:
+            log.info("%s source %s (hls origin)", self.label, _redact(url))
+        else:
+            log.info("%s station looked up again: %s (hls origin, lookup #%d)", self.label, _redact(url), lookups)
+
+    def _fetch_playlist(self) -> tuple[str, str]:
+        """The station's media playlist as it stands, looking the station up again if the address was refused."""
+        with self._lock:
+            url, seen = self._media_url, self._generation
+        if url is None:
+            self._look_up(seen)
+            with self._lock:
+                url, seen = self._media_url, self._generation
+        reply = self._session.get(url, timeout=ORIGIN_FETCH_TIMEOUT)
+        if _refused(reply.status_code):
+            self._look_up(seen)
+            with self._lock:
+                url = self._media_url
+            reply = self._session.get(url, timeout=ORIGIN_FETCH_TIMEOUT)
+        reply.raise_for_status()
+        if "#EXTM3U" not in reply.text[:64]:
+            raise ValueError("the station's address did not return a playlist")
+        return reply.text, reply.url
+
+    def _rewrite(self, text: str, base: str) -> str:
+        """The playlist with every segment (and its opening segment) pointed back here."""
+        out, order, listed, seen, maps = [], [], set(), {}, set()
+        first_seq = None
+
+        def local(address: str) -> str:
+            address = urljoin(base, address)
+            name = urlsplit(address).path.rsplit("/", 1)[-1] or "segment"   # the same whichever signature it carries
+            seen[name] = address
+            listed.add(name)
+            return f"seg/{name}"
+
+        for line in text.splitlines():
+            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                with contextlib.suppress(ValueError):
+                    first_seq = int(line.split(":", 1)[1])
+            elif line.startswith("#EXT-X-MAP"):
+                line = _ORIGIN_URI_RE.sub(lambda m: f"{m[1]}{local(m[2])}{m[3]}", line)
+                maps.update(n[len("seg/"):] for n in re.findall(r"seg/[^\"]+", line))
+            elif line and not line.startswith("#"):
+                line = local(line)
+                order.append(line[len("seg/"):])
+            out.append(line)
+        self._check_continuity(first_seq, order)
+        with self._lock:
+            self._maps |= maps
+            for name, address in seen.items():
+                self._segments[name] = address
+                self._segments.move_to_end(name)
+            while len(self._segments) > ORIGIN_SEGMENTS_KEPT:
+                self._segments.popitem(last=False)
+            self._order, self._listed = order, listed
+        return "\n".join(out) + "\n"
+
+    def _check_continuity(self, first_seq: int | None, order: list[str]) -> None:
+        """ffmpeg follows the playlist's sequence numbers itself; this only checks the station keeps them.
+
+        After a look-up the station must carry on with the same numbering: the same
+        sequence number naming the same segment. If it does not (another rendition
+        with its own numbering, say), ffmpeg would hear a jump, so it is logged.
+        """
+        if first_seq is None:
+            return
+        problem = None
+        with self._lock:
+            known = self._seq_names
+            if first_seq < self._first_seq:   # a live playlist only ever moves forward
+                problem = f"sequence went back to {first_seq} from {self._first_seq}"
+            self._first_seq = max(self._first_seq, first_seq)
+            for offset, name in enumerate(order):
+                seq = first_seq + offset
+                if seq in known and known[seq] != name:
+                    problem = problem or f"segment {seq} was {known[seq]}, now {name}"
+                known[seq] = name
+                known.move_to_end(seq)
+            while len(known) > ORIGIN_SEGMENTS_KEPT:
+                known.popitem(last=False)
+            generation, warned = self._generation, self._seq_warned
+            if problem:
+                self._seq_warned = generation
+        if problem and warned != generation:
+            log.warning("%s station's segment numbering broke after a look-up (%s); the audio may jump", self.label, problem)
+
+    def _get(self, name: str, wait_s: float = ORIGIN_RESIGN_WAIT_S) -> bytes | None:
+        """A segment from the station, waiting out a re-signing (up to wait_s) if it is refused.
+
+        None if the station no longer has it, or it was still refused at the end.
+        """
+        with self._lock:
+            address, seen = self._segments.get(name), self._generation
+        if address is None:
+            return None
+        started = time.monotonic()
+        refused: int | None = None
+        while not self._closed:
+            reply = self._session.get(address, timeout=ORIGIN_FETCH_TIMEOUT)
+            if reply.ok:
+                if refused:
+                    log.info("%s segment %s refused (%d), fetched freshly signed after %.1fs",
+                             self.label, name, refused, time.monotonic() - started)
+                return reply.content
+            if reply.status_code == 404:
+                return None   # gone from the station
+            if not _refused(reply.status_code):
+                reply.raise_for_status()
+            if time.monotonic() - started >= wait_s:
+                log.warning("%s segment %s still refused (%d) after %.0fs",
+                            self.label, name, reply.status_code, wait_s)
+                return None
+            if refused is None:
+                self._look_up(seen)   # one fresh look-up for a new signature
+            else:
+                time.sleep(ORIGIN_RESIGN_POLL_S)   # the station is still handing out the old one
+            refused = reply.status_code
+            self._rewrite(*self._fetch_playlist())
+            with self._lock:
+                if name not in self._listed:
+                    return None   # the station has moved past it
+                address, seen = self._segments[name], self._generation
+        return None
+
+    def _prefetch_loop(self) -> None:
+        next_refresh = 0.0
+        while not self._closed:
+            self._wake.wait(1.0)
+            self._wake.clear()
+            if self._closed:
+                return
+            if self._last_asked is not None and time.monotonic() >= next_refresh:
+                next_refresh = time.monotonic() + self.PLAYLIST_REFRESH_S
+                try:
+                    self._rewrite(*self._fetch_playlist())
+                except Exception as e:
+                    status = getattr(getattr(e, "response", None), "status_code", None)
+                    log.debug("%s hls origin: reading the playlist ahead failed (%s%s)", self.label,
+                              type(e).__name__, f" {status}" if status else "")
+            with self._lock:
+                maps = [n for n in self._maps if n not in self._map_cache]
+                if self._last_asked in self._order:
+                    i = self._order.index(self._last_asked)
+                    ahead = [n for n in self._order[i + 1:i + 1 + self.PREFETCH_AHEAD] if n not in self._cache]
+                else:
+                    ahead = []
+                targets = maps + ahead
+            for name in targets:
+                if self._closed:
+                    return
+                try:
+                    data = self._get(name)
+                except Exception as e:
+                    status = getattr(getattr(e, "response", None), "status_code", None)
+                    log.debug("%s hls origin: fetching %s ahead failed (%s%s)", self.label, name,
+                              type(e).__name__, f" {status}" if status else "")
+                    break
+                if data is None:
+                    continue
+                self._keep(name, data)
+
+    def _keep(self, name: str, data: bytes) -> None:
+        with self._lock:
+            if name in self._maps:
+                self._map_cache[name] = data
+            else:
+                self._cache[name] = data
+                while len(self._cache) > self.CACHE_MAX:
+                    self._cache.popitem(last=False)
+
+    # ---- for the HTTP handler (ffmpeg's requests) ----
+
+    def playlist(self) -> bytes:
+        body = self._rewrite(*self._fetch_playlist()).encode()
+        self._wake.set()
+        return body
+
+    def segment(self, name: str) -> bytes | None:
+        """A segment's bytes, or None if the station no longer has it."""
+        with self._lock:
+            if name in self._order:
+                self._last_asked = name
+            data = self._map_cache.get(name) if name in self._maps else self._cache.pop(name, None)
+        self._wake.set()
+        if data is None:
+            data = self._get(name, ORIGIN_INLINE_WAIT_S)
+            if data is not None and name in self._maps:
+                self._keep(name, data)
+        return data
+
+
+_origins: dict[str, HlsOrigin] = {}
+_origins_lock = threading.Lock()
+
+
 # ---------- ffmpeg command builders ----------
 def _input_args(url: str, extra: list[str], *, probe_fast: bool) -> list[str]:
     # Copying needs no decoding, so it can start on the first packet. Decoding
@@ -464,6 +786,13 @@ def encode_cmd(pcm: PcmFormat, fmt: str) -> list[str]:
 
 # ---------- process plumbing ----------
 _OUTPUT_AUDIO_RE = re.compile(r"Audio: pcm_\w+, (\d+) Hz")
+# ffmpeg's level tag comes after the component's own tag when there is one: "[hls @ 0x..] [warning] ..."
+_FFMPEG_LEVEL_RE = re.compile(r"^(?:\[[^\]]+ @ [^\]]+\] )?\[(warning|error|fatal|panic)\]")
+# Expected and harmless, so not logged: ffmpeg re-reads the opening segment of an
+# fMP4 HLS station after every playlist reload (Apple's: about every 32 s), and
+# it adds the line ending our -headers value leaves off.
+_FFMPEG_QUIET = ("Found duplicated MOOV Atom", "No trailing CRLF found in HTTP header")
+_SIGNED_QUERY_RE = re.compile(r"(https?://[^\s'\"?]+)\?[^\s'\"]*")
 _INPUT_AUDIO_RE = re.compile(r"Stream #\d+:\d+.*?: Audio: (\w+)")
 
 
@@ -511,10 +840,13 @@ class FFmpegProc:
                             self.output_rate = int(m.group(1))
                             self.rate_known.set()
 
-                if line.startswith(("[error]", "[fatal]", "[panic]")):
-                    log.error("%s ffmpeg: %s", self.label, line)
-                elif line.startswith("[warning]"):
-                    log.warning("%s ffmpeg: %s", self.label, line)
+                level = _FFMPEG_LEVEL_RE.match(line)
+                if level and not any(quiet in line for quiet in _FFMPEG_QUIET):
+                    shown = _SIGNED_QUERY_RE.sub(r"\1", line)   # no signatures in the log
+                    if level.group(1) == "warning":
+                        log.warning("%s ffmpeg: %s", self.label, shown)
+                    else:
+                        log.error("%s ffmpeg: %s", self.label, shown)
         except Exception:
             pass
         finally:
@@ -629,8 +961,12 @@ class AdtsFramer:
         return dropped
 
 
-def stream_copy(spec: StreamSpec, label: str):
-    """Yield the source's own audio, restarting ffmpeg in place when it exits."""
+def stream_copy(spec: StreamSpec, label: str, resolve=None):
+    """Yield the source's own audio, restarting ffmpeg in place when it exits.
+
+    resolve() gives ffmpeg's input (URL, extra args); by default the source itself.
+    """
+    resolve = resolve or (lambda: resolve_source(spec.src))
     stop = threading.Event()
     restarter = Restarter(label)
     proc: FFmpegProc | None = None
@@ -638,7 +974,7 @@ def stream_copy(spec: StreamSpec, label: str):
     try:
         while not stop.is_set():
             try:
-                url, extra = resolve_source(spec.src)
+                url, extra = resolve()
             except Exception as e:
                 log.warning("%s resolve failed: %s", label, e)
                 if not restarter.run_ended(0, produced=False):
@@ -685,12 +1021,14 @@ def stream_copy(spec: StreamSpec, label: str):
             proc.stop()
 
 
-def stream_encoded(spec: StreamSpec, label: str):
+def stream_encoded(spec: StreamSpec, label: str, resolve=None):
     """Yield one continuous encoded stream (FLAC/WAV).
 
     A restartable decoder feeds raw PCM to a single long-lived encoder, so a
     source restart never puts a second stream header in front of the player.
+    resolve() gives the decoder's input (URL, extra args); by default the source itself.
     """
+    resolve = resolve or (lambda: resolve_source(spec.src))
     stop = threading.Event()
     restarter = Restarter(label)
     state: dict = {"decoder": None, "encoder": None}
@@ -698,7 +1036,7 @@ def stream_encoded(spec: StreamSpec, label: str):
     def start_decoder(pcm_rate: int | None) -> tuple[FFmpegProc, str] | None:
         while not stop.is_set():
             try:
-                url, extra = resolve_source(spec.src)
+                url, extra = resolve()
             except Exception as e:
                 log.warning("%s resolve failed: %s", label, e)
                 if not restarter.run_ended(0, produced=False):
@@ -956,7 +1294,9 @@ class Listener:
     def event(self, at: float, text: str) -> None:
         """A log line about this connection, filed here by _EventTap."""
         if text.startswith("source "):
-            self.source = text[len("source "):]
+            # With the HLS origin, ffmpeg's own line names the local address; the station's is the one to keep.
+            if text.endswith("(hls origin)") or not (self.source or "").endswith("(hls origin)"):
+                self.source = text[len("source "):]
         elif text.startswith("restarting source"):
             self.source_restarts += 1
         self.events.append((at, text))
@@ -1294,9 +1634,19 @@ def _captures_note() -> str:
     except OSError as exc:
         return f"captures off: cannot write to {CAPTURE_DIR} ({exc.strerror or exc})"
     kept = f"captures in {CAPTURE_DIR}: the last {CAPTURE_SECONDS:g}s of audio and a report per listener, {KEEP_CAPTURES} kept"
-    if os.path.ismount(CAPTURE_DIR):
+    if _on_a_mount(CAPTURE_DIR):
         return kept
-    return kept + " (not a mounted folder, so they go when the container is replaced)"
+    return kept + " (not on a mounted folder, so they go when the container is replaced)"
+
+
+def _on_a_mount(path: str) -> bool:
+    """True if path, or any folder above it short of the root, is a mounted folder."""
+    path = os.path.abspath(path)
+    while path != os.path.dirname(path):
+        if os.path.ismount(path):
+            return True
+        path = os.path.dirname(path)
+    return False
 
 
 _listeners: dict[int, Listener] = {}
@@ -1344,6 +1694,7 @@ def _status() -> dict:
         "uptime_s": round(time.monotonic() - _STARTED),
         "default_fmt": DEFAULT_FMT,
         "burst_s": BURST_SECONDS,
+        "hls_origin": HLS_ORIGIN,
         "captures": CAPTURE_DIR,
         "listeners": [one(x) for x in listeners],
     }
@@ -1406,6 +1757,9 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/status":
                 return self._send_json(200, _status(), pretty=True)
 
+            if url.path.startswith(HLS_ORIGIN_PATH + "/"):
+                return self._serve_origin(url.path)
+
             if url.path.startswith("/s/"):
                 name = unquote(url.path[len("/s/"):])
                 station = STATIONS.get(name)
@@ -1436,6 +1790,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_bytes(self, status: int, ctype: str, data: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_origin(self, path: str) -> None:
+        """A listener's ffmpeg asking for its station's playlist or a segment (see HlsOrigin)."""
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            return self._send_json(404, {"error": "not found"})   # for this process's own ffmpeg only
+        parts = path[len(HLS_ORIGIN_PATH) + 1:].split("/")
+        with _origins_lock:
+            origin = _origins.get(parts[0])
+        if origin is None:
+            return self._send_json(404, {"error": "no such stream"})
+        try:
+            if parts[1:] == ["index.m3u8"]:
+                return self._send_bytes(200, "application/vnd.apple.mpegurl", origin.playlist())
+            if len(parts) == 3 and parts[1] == "seg":
+                data = origin.segment(parts[2])
+                if data is None:
+                    return self._send_json(404, {"error": "the station no longer has this segment"})
+                return self._send_bytes(200, "application/octet-stream", data)
+        except Exception as e:
+            # Never log the exception text: requests puts the signed address in it.
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            log.warning("%s hls origin: %s failed (%s%s)", origin.label, "/".join(parts[1:]),
+                        type(e).__name__, f" {status}" if status else "")
+            return self._send_json(502, {"error": "the station could not be reached"})
+        return self._send_json(404, {"error": "not found"})
+
     def _stream(self, spec: StreamSpec) -> None:
         client = self.headers.get("X-Forwarded-For") or self.client_address[0]
         with _conn_lock:
@@ -1451,11 +1838,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("icy-pub", "0")
         self.end_headers()
 
-        gen = stream_copy(spec, label) if spec.fmt in COPY_FORMATS else stream_encoded(spec, label)
         # The listener object only watches: see "what each listener was sent" above.
         listener = Listener(label, spec, client, self.connection)
         with _listeners_lock:
             _listeners[conn] = listener
+
+        origin, resolve = None, None
+        if _wants_origin(spec.src):
+            candidate = HlsOrigin(secrets.token_hex(8), spec.src, label)
+            try:
+                if candidate.prepare():
+                    origin = candidate
+            except Exception as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                log.warning("%s station look-up failed (%s%s); trying directly", label, type(e).__name__,
+                            f" {status}" if status else "")
+            if origin is None:
+                candidate.close()
+            else:
+                with _origins_lock:
+                    _origins[origin.token] = origin
+                resolve = lambda: (origin.playlist_url, [])
+        gen = stream_copy(spec, label, resolve) if spec.fmt in COPY_FORMATS else stream_encoded(spec, label, resolve)
         reason = "stream failed"
         try:
             for chunk in gen:
@@ -1468,6 +1872,10 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             listener.stopped(reason)
             gen.close()
+            if origin is not None:
+                with _origins_lock:
+                    _origins.pop(origin.token, None)
+                origin.close()
             with _listeners_lock:
                 _listeners.pop(conn, None)
             listener.finish()
@@ -1484,7 +1892,7 @@ class Server(ThreadingHTTPServer):
 
 
 def main() -> None:
-    port = int(os.environ.get("PORT", "8000"))
+    port = PORT
     server = Server(("0.0.0.0", port), Handler)
 
     def stop(*_):
@@ -1498,6 +1906,11 @@ def main() -> None:
         port, _build_date(), DEFAULT_FMT, BURST_SECONDS, len(STATIONS),
     )
     log.info(_captures_note())
+    log.info(
+        "TuneIn stations: %s",
+        "served to ffmpeg from a local playlist that never runs out (HLS_ORIGIN=0 to turn off)"
+        if HLS_ORIGIN else "handed to ffmpeg directly; it restarts when the signed address runs out",
+    )
     server.serve_forever()
     # Stopping cuts every listener off: leave a report for each, saying it was us.
     with _listeners_lock:
