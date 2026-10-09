@@ -358,6 +358,9 @@ def _redact(url: str) -> str:
 HLS_ORIGIN = os.environ.get("HLS_ORIGIN", "1").strip().lower() not in ("0", "false", "no", "off")
 HLS_ORIGIN_PATH = "/_hls"
 ORIGIN_FETCH_TIMEOUT = (4, 10)   # (connect, read) seconds
+# The playlist is small and normally answered at once, so a read that hangs is given up on
+# early and asked again: one stuck request then costs a few seconds, not ten.
+ORIGIN_PLAYLIST_TIMEOUT = (3, 4)
 ORIGIN_SEGMENTS_KEPT = 128       # names remembered; a live playlist lists about ten
 # Apple's segment signatures all run out together on a six-hourly boundary
 # (01:00, 07:00, 13:00, 19:00 UK), answered with 403 or 433, and until the
@@ -399,6 +402,15 @@ class HlsOrigin:
     # The playlist is also read here this often (once ffmpeg has started), so a new segment
     # is fetched the moment the station publishes it rather than when ffmpeg next looks.
     PLAYLIST_REFRESH_S = 2.0
+    # ffmpeg ends if a playlist request fails, so while the station's playlist cannot be read
+    # ffmpeg is given the last one that could, for up to this long. It carries on with the
+    # segments already in hand and simply sees nothing new.
+    PLAYLIST_STALE_S = 60.0
+    # Given a playlist with nothing new in it, ffmpeg sleeps half a segment (8 s on Apple's)
+    # before asking again. So when it has used up everything the copy in hand lists, its
+    # request is held this long for a newer one (well inside ffmpeg's 15 s -rw_timeout).
+    PLAYLIST_HOLD_S = 10.0
+    PLAYLIST_LATE_NOTE_S = 6.0   # unread for this long is worth a line in the log
 
     def __init__(self, token: str, src: str, label: str) -> None:
         self.token = token
@@ -423,6 +435,9 @@ class HlsOrigin:
         self._seq_warned = -1   # look-up generation already warned about
         self._first_seq = -1    # the latest playlist's first sequence number
         self._last_asked: str | None = None
+        self._playlist: bytes | None = None   # the latest playlist as ffmpeg is given it
+        self._playlist_at = 0.0               # when the station last gave it (monotonic)
+        self._late_noted = False              # a "could not be read" line is out, awaiting its "readable again"
         self._wake = threading.Event()
         self._closed = False
         self.lookups = 0
@@ -475,12 +490,12 @@ class HlsOrigin:
             self._look_up(seen)
             with self._lock:
                 url, seen = self._media_url, self._generation
-        reply = self._session.get(url, timeout=ORIGIN_FETCH_TIMEOUT)
+        reply = self._session.get(url, timeout=ORIGIN_PLAYLIST_TIMEOUT)
         if _refused(reply.status_code):
             self._look_up(seen)
             with self._lock:
                 url = self._media_url
-            reply = self._session.get(url, timeout=ORIGIN_FETCH_TIMEOUT)
+            reply = self._session.get(url, timeout=ORIGIN_PLAYLIST_TIMEOUT)
         reply.raise_for_status()
         if "#EXTM3U" not in reply.text[:64]:
             raise ValueError("the station's address did not return a playlist")
@@ -518,7 +533,12 @@ class HlsOrigin:
             while len(self._segments) > ORIGIN_SEGMENTS_KEPT:
                 self._segments.popitem(last=False)
             self._order, self._listed = order, listed
-        return "\n".join(out) + "\n"
+            body = "\n".join(out) + "\n"
+            late = time.monotonic() - self._playlist_at if self._late_noted else None
+            self._playlist, self._playlist_at, self._late_noted = body.encode(), time.monotonic(), False
+        if late is not None:
+            log.info("%s station's playlist readable again after %.0fs", self.label, late)
+        return body
 
     def _check_continuity(self, first_seq: int | None, order: list[str]) -> None:
         """ffmpeg follows the playlist's sequence numbers itself; this only checks the station keeps them.
@@ -602,6 +622,14 @@ class HlsOrigin:
                     status = getattr(getattr(e, "response", None), "status_code", None)
                     log.debug("%s hls origin: reading the playlist ahead failed (%s%s)", self.label,
                               type(e).__name__, f" {status}" if status else "")
+                    next_refresh = 0.0   # ask again straight away
+                    with self._lock:
+                        late = time.monotonic() - self._playlist_at if self._playlist is not None else 0.0
+                        note = late >= self.PLAYLIST_LATE_NOTE_S and not self._late_noted
+                        self._late_noted = self._late_noted or note
+                    if note:
+                        log.warning("%s station's playlist could not be read for %.0fs (%s%s); ffmpeg is given the last one",
+                                    self.label, late, type(e).__name__, f" {status}" if status else "")
             with self._lock:
                 maps = [n for n in self._maps if n not in self._map_cache]
                 if self._last_asked in self._order:
@@ -636,9 +664,33 @@ class HlsOrigin:
     # ---- for the HTTP handler (ffmpeg's requests) ----
 
     def playlist(self) -> bytes:
-        body = self._rewrite(*self._fetch_playlist()).encode()
+        """The playlist for ffmpeg, which must never be refused one (it ends if it is).
+
+        Once ffmpeg is playing, the read-ahead thread keeps the playlist current and
+        ffmpeg is given that copy: the latest, or, while the station cannot be read,
+        the last one that could (up to PLAYLIST_STALE_S old). It is handed over at
+        once if it lists a segment ffmpeg has not had yet; if ffmpeg has used up all
+        it lists, the request waits up to PLAYLIST_HOLD_S for a newer copy. Only
+        before ffmpeg is playing, or with nothing recent enough in hand, is the
+        station read here.
+        """
         self._wake.set()
-        return body
+        give_up = time.monotonic() + self.PLAYLIST_HOLD_S
+        while True:
+            with self._lock:
+                body, age = self._playlist, time.monotonic() - self._playlist_at
+                asked, order = self._last_asked, self._order
+            if body is None or asked is None or age > self.PLAYLIST_STALE_S:
+                break
+            if asked not in order or order[-1] != asked or time.monotonic() >= give_up or self._closed:
+                return body
+            time.sleep(0.1)
+        try:
+            return self._rewrite(*self._fetch_playlist()).encode()
+        except Exception:
+            if body is None or age > self.PLAYLIST_STALE_S:
+                raise
+            return body
 
     def segment(self, name: str) -> bytes | None:
         """A segment's bytes, or None if the station no longer has it."""
