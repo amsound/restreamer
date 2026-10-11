@@ -375,6 +375,180 @@ ORIGIN_RESIGN_WAIT_S = 24.0
 ORIGIN_INLINE_WAIT_S = 13.0
 ORIGIN_RESIGN_POLL_S = 2.0
 _ORIGIN_URI_RE = re.compile(r'(URI=")([^"]+)(")')
+# A station that sends fragmented MP4 (Apple's does) is handed to ffmpeg as plain
+# AAC (ADTS) segments instead: the same audio frames, each given its 7-byte
+# header here. ffmpeg's MP4 reader keeps a note of every frame it has ever read
+# and has no setting to stop, so its memory grew for as long as a listener
+# stayed (about 4 MB an hour; 257 MB after 40 hours when measured). Its plain-AAC
+# reader does not (48 MB at 10 hours and at 40). HLS_ORIGIN_AAC=0 hands the
+# segments on untouched, as before.
+ORIGIN_AS_AAC = os.environ.get("HLS_ORIGIN_AAC", "1").strip().lower() not in ("0", "false", "no", "off")
+_AAC_RATES = (96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350)
+
+
+def _mp4_boxes(data: bytes, start: int = 0, end: int | None = None):
+    """(type, payload start, box end) for each MP4 box in data[start:end]."""
+    end = len(data) if end is None else end
+    pos = start
+    while pos + 8 <= end:
+        size, kind = struct.unpack_from(">I4s", data, pos)
+        header = 8
+        if size == 1:
+            if pos + 16 > end:
+                raise ValueError("truncated MP4 box")
+            size, header = struct.unpack_from(">Q", data, pos + 8)[0], 16
+        elif size == 0:
+            size = end - pos
+        if size < header or pos + size > end:
+            raise ValueError("MP4 box runs past the end of the data")
+        yield kind, pos + header, pos + size
+        pos += size
+
+
+def _mp4_find(data: bytes, path: tuple[bytes, ...], start: int = 0, end: int | None = None) -> tuple[int, int] | None:
+    """Payload range of the first box at the nested path, or None."""
+    for kind, p, e in _mp4_boxes(data, start, end):
+        if kind == path[0]:
+            if len(path) == 1:
+                return p, e
+            found = _mp4_find(data, path[1:], p, e)
+            if found:
+                return found
+    return None
+
+
+def _aac_description(init: bytes) -> tuple[int, int, int, int]:
+    """What an ADTS header must say, read from an fMP4 opening segment.
+
+    (object type, sample rate index, channels, default frame size). ValueError
+    if the audio is not AAC-LC or HE-AAC in the clear.
+    """
+    stsd = _mp4_find(init, (b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"))
+    if not stsd:
+        raise ValueError("opening segment has no audio description")
+    asc = None
+    for kind, p, e in _mp4_boxes(init, stsd[0] + 8, stsd[1]):   # past version/flags and the entry count
+        if kind != b"mp4a":
+            raise ValueError("audio is not plain AAC")           # enca (encrypted), ac-3, ...
+        esds = _mp4_find(init, (b"esds",), p + 28, e)             # 28 = the fixed audio sample entry fields
+        if not esds:
+            raise ValueError("mp4a entry has no esds")
+        pos = esds[0] + 4                                         # version and flags
+        while pos < esds[1] and asc is None:
+            tag, length, pos = init[pos], 0, pos + 1
+            for _ in range(4):                                    # a length in 7-bit groups
+                b = init[pos]
+                pos += 1
+                length = (length << 7) | (b & 0x7F)
+                if not b & 0x80:
+                    break
+            if tag == 0x03:      # ES_Descriptor: walk into it
+                flags = init[pos + 2]
+                pos += 3 + (2 if flags & 0x80 else 0)
+                if flags & 0x40:
+                    pos += 1 + init[pos]
+                if flags & 0x20:
+                    pos += 2
+            elif tag == 0x04:    # DecoderConfigDescriptor: walk into it
+                pos += 13
+            elif tag == 0x05:    # DecoderSpecificInfo: the AudioSpecificConfig
+                asc = init[pos:pos + length]
+            else:
+                pos += length
+        break
+    if not asc:
+        raise ValueError("opening segment has no AAC description")
+    bits, left = int.from_bytes(asc, "big"), len(asc) * 8
+
+    def read(n: int) -> int:
+        nonlocal left
+        if n > left:
+            raise ValueError("AAC description is cut short")
+        left -= n
+        return (bits >> left) & ((1 << n) - 1)
+
+    def object_type() -> int:
+        aot = read(5)
+        return 32 + read(6) if aot == 31 else aot
+
+    def rate_index() -> int:
+        idx = read(4)
+        if idx != 15:
+            return idx
+        rate = read(24)
+        if rate not in _AAC_RATES:
+            raise ValueError("non-standard sample rate")
+        return _AAC_RATES.index(rate)
+
+    aot, idx, channels = object_type(), rate_index(), read(4)
+    if aot in (5, 29):
+        # HE-AAC signalled explicitly: an AAC-LC core at the rate above. ADTS carries
+        # the core; a player finds the SBR/PS extension inside the frames.
+        rate_index()
+        aot = object_type()
+    if aot != 2 or idx >= len(_AAC_RATES) or not 1 <= channels <= 7:
+        raise ValueError("AAC of a kind ADTS cannot carry")
+    trex = _mp4_find(init, (b"moov", b"mvex", b"trex"))
+    return aot, idx, channels, struct.unpack_from(">I", init, trex[0] + 16)[0] if trex else 0
+
+
+def _fmp4_to_adts(segment: bytes, description: tuple[int, int, int, int]) -> bytes:
+    """An fMP4 media segment as ADTS: every AAC frame, in order, each behind its 7-byte header."""
+    aot, idx, channels, init_default = description
+    b2, b3 = ((aot - 1) << 6) | (idx << 2) | (channels >> 2), (channels & 3) << 6
+    out = bytearray()
+    pending: list[tuple[int | None, list[int]]] = []   # (absolute offset or None, frame sizes) per trun
+    for kind, p, e in _mp4_boxes(segment):
+        if kind == b"moof":
+            pending = []
+            traf = _mp4_find(segment, (b"traf",), p, e)
+            if not traf:
+                continue
+            base, default_size = p - 8, init_default
+            for tkind, tp, te in _mp4_boxes(segment, *traf):
+                if tkind == b"tfhd":
+                    flags = struct.unpack_from(">I", segment, tp)[0] & 0xFFFFFF
+                    pos = tp + 8
+                    if flags & 0x01:
+                        base = struct.unpack_from(">Q", segment, pos)[0]
+                        pos += 8
+                    pos += (4 if flags & 0x02 else 0) + (4 if flags & 0x08 else 0)
+                    if flags & 0x10:
+                        default_size = struct.unpack_from(">I", segment, pos)[0]
+                elif tkind == b"trun":
+                    flags = struct.unpack_from(">I", segment, tp)[0] & 0xFFFFFF
+                    count = struct.unpack_from(">I", segment, tp + 4)[0]
+                    pos, offset = tp + 8, None
+                    if flags & 0x01:
+                        offset = base + struct.unpack_from(">i", segment, pos)[0]
+                        pos += 4
+                    if flags & 0x04:
+                        pos += 4
+                    per_sample = 4 * sum(bool(flags & f) for f in (0x100, 0x200, 0x400, 0x800))
+                    if pos + count * per_sample > te:
+                        raise ValueError("MP4 frame table runs past its box")
+                    if flags & 0x200:
+                        skip = 4 if flags & 0x100 else 0
+                        sizes = [struct.unpack_from(">I", segment, pos + i * per_sample + skip)[0] for i in range(count)]
+                    else:
+                        sizes = [default_size] * count
+                    pending.append((offset, sizes))
+        elif kind == b"mdat":
+            pos = p
+            for offset, sizes in pending:
+                if offset is not None:
+                    pos = offset
+                for size in sizes:
+                    n = size + 7
+                    if size <= 0 or pos + size > len(segment) or n > 0x1FFF:
+                        raise ValueError("MP4 frame table does not fit the segment")
+                    out += bytes((0xFF, 0xF1, b2, b3 | (n >> 11), (n >> 3) & 0xFF, ((n & 7) << 5) | 0x1F, 0xFC))
+                    out += segment[pos:pos + size]
+                    pos += size
+            pending = []
+    if not out:
+        raise ValueError("MP4 segment holds no audio frames")
+    return bytes(out)
 
 
 def _wants_origin(src: str) -> bool:
@@ -431,6 +605,10 @@ class HlsOrigin:
         # every playlist reload, so they are kept for good and answered from memory.
         self._maps: set[str] = set()
         self._map_cache: dict[str, bytes] = {}
+        # Settled once in prepare(): MP4 segments are handed to ffmpeg as plain AAC (see ORIGIN_AS_AAC).
+        self._as_aac = False
+        self._aac: dict[str, tuple[int, int, int, int]] = {}   # opening segment name -> what its audio is
+        self._seg_map: dict[str, str] = {}                     # media segment name -> its opening segment
         self._seq_names: collections.OrderedDict[int, str] = collections.OrderedDict()   # media sequence -> name
         self._seq_warned = -1   # look-up generation already warned about
         self._first_seq = -1    # the latest playlist's first sequence number
@@ -446,7 +624,36 @@ class HlsOrigin:
     def prepare(self) -> bool:
         """Look the station up now. True if it is HLS (and so worth serving from here)."""
         self._look_up(self._generation)
-        return bool(HLS_RE.search(self._media_url or ""))
+        if not HLS_RE.search(self._media_url or ""):
+            return False
+        self._choose_form()
+        return True
+
+    def _choose_form(self) -> None:
+        """Settle, before ffmpeg starts, whether its segments are handed over as plain AAC.
+
+        They are if the station's segments are MP4 holding AAC that ADTS can
+        carry. Anything else (or any trouble finding out) leaves them as they come.
+        """
+        if not ORIGIN_AS_AAC:
+            return
+        try:
+            text, base = self._fetch_playlist()
+            found = re.search(r'#EXT-X-MAP:[^\n]*?URI="([^"]+)"', text)
+            if not found:
+                return   # not MP4 segments
+            address = urljoin(base, found[1])
+            reply = self._session.get(address, timeout=ORIGIN_FETCH_TIMEOUT)
+            reply.raise_for_status()
+            name = urlsplit(address).path.rsplit("/", 1)[-1] or "segment"
+            description = _aac_description(reply.content)
+            with self._lock:
+                self._aac[name], self._map_cache[name], self._as_aac = description, reply.content, True
+            log.info("%s MP4 segments are handed to ffmpeg as plain AAC (%d Hz, %d ch)",
+                     self.label, _AAC_RATES[description[1]], description[2])
+        except Exception as e:
+            # Never the exception text: requests puts the signed address in it.
+            log.info("%s segments are handed to ffmpeg as they come (%s)", self.label, type(e).__name__)
 
     @property
     def playlist_url(self) -> str:
@@ -505,6 +712,7 @@ class HlsOrigin:
         """The playlist with every segment (and its opening segment) pointed back here."""
         out, order, listed, seen, maps = [], [], set(), {}, set()
         first_seq = None
+        as_aac, seg_map, current_map = self._as_aac, {}, None
 
         def local(address: str) -> str:
             address = urljoin(base, address)
@@ -519,9 +727,23 @@ class HlsOrigin:
                     first_seq = int(line.split(":", 1)[1])
             elif line.startswith("#EXT-X-MAP"):
                 line = _ORIGIN_URI_RE.sub(lambda m: f"{m[1]}{local(m[2])}{m[3]}", line)
-                maps.update(n[len("seg/"):] for n in re.findall(r"seg/[^\"]+", line))
+                named = [n[len("seg/"):] for n in re.findall(r"seg/[^\"]+", line)]
+                maps.update(named)
+                if as_aac:
+                    # Plain AAC needs no opening segment; it is still fetched here, to read the audio's description.
+                    current_map = named[0] if named else None
+                    continue
             elif line and not line.startswith("#"):
-                line = local(line)
+                if as_aac and current_map:
+                    # The same segment under a name that says what ffmpeg will be given.
+                    address = urljoin(base, line)
+                    name = (urlsplit(address).path.rsplit("/", 1)[-1] or "segment").rsplit(".", 1)[0] + ".aac"
+                    seen[name] = address
+                    listed.add(name)
+                    seg_map[name] = current_map
+                    line = f"seg/{name}"
+                else:
+                    line = local(line)
                 order.append(line[len("seg/"):])
             out.append(line)
         self._check_continuity(first_seq, order)
@@ -532,6 +754,7 @@ class HlsOrigin:
                 self._segments.move_to_end(name)
             while len(self._segments) > ORIGIN_SEGMENTS_KEPT:
                 self._segments.popitem(last=False)
+            self._seg_map = {n: m for n, m in {**self._seg_map, **seg_map}.items() if n in self._segments}
             self._order, self._listed = order, listed
             body = "\n".join(out) + "\n"
             late = time.monotonic() - self._playlist_at if self._late_noted else None
@@ -607,6 +830,23 @@ class HlsOrigin:
                 address, seen = self._segments[name], self._generation
         return None
 
+    def _fetch(self, name: str, wait_s: float = ORIGIN_RESIGN_WAIT_S) -> bytes | None:
+        """A segment as ffmpeg is to have it: fetched (see _get), and MP4 audio turned into plain AAC if that is the form in use."""
+        data = self._get(name, wait_s)
+        with self._lock:
+            map_name = self._seg_map.get(name) if self._as_aac else None
+            description = self._aac.get(map_name) if map_name else None
+        if data is None or map_name is None:
+            return data
+        if description is None:   # the station has changed its opening segment
+            opening = self._get(map_name, wait_s)
+            if opening is None:
+                raise ValueError("the segment's opening segment is not available")
+            description = _aac_description(opening)
+            with self._lock:
+                self._aac[map_name] = description
+        return _fmp4_to_adts(data, description)
+
     def _prefetch_loop(self) -> None:
         next_refresh = 0.0
         while not self._closed:
@@ -642,7 +882,7 @@ class HlsOrigin:
                 if self._closed:
                     return
                 try:
-                    data = self._get(name)
+                    data = self._fetch(name)
                 except Exception as e:
                     status = getattr(getattr(e, "response", None), "status_code", None)
                     log.debug("%s hls origin: fetching %s ahead failed (%s%s)", self.label, name,
@@ -700,7 +940,7 @@ class HlsOrigin:
             data = self._map_cache.get(name) if name in self._maps else self._cache.pop(name, None)
         self._wake.set()
         if data is None:
-            data = self._get(name, ORIGIN_INLINE_WAIT_S)
+            data = self._fetch(name, ORIGIN_INLINE_WAIT_S)
             if data is not None and name in self._maps:
                 self._keep(name, data)
         return data

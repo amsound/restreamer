@@ -115,6 +115,31 @@ Environment:
 | `STATIONS_FILE` | `/data/stations.yaml` | |
 | `CAPTURE_DIR` | `/data/captures` | Where each listener's last audio and report are written |
 | `LOG_LEVEL` | `INFO` | |
+| `HLS_ORIGIN` | `1` | TuneIn stations are served to ffmpeg from a local playlist (see below). `0`: ffmpeg reads the station directly and restarts when its address expires. |
+| `HLS_ORIGIN_AAC` | `1` | With the local playlist, MP4 segments are handed to ffmpeg as plain AAC. `0`: handed on untouched. |
+
+## TuneIn stations: the local playlist
+
+A TuneIn station's addresses are signed and run out (Apple's: the playlist
+address about every six hours, the segment addresses at 01:00, 07:00, 13:00 and
+19:00 UK time). ffmpeg reading one directly ends when that happens, and
+restarting it repeats a little audio. So for these stations ffmpeg is given a
+playlist on this machine instead, whose addresses never change:
+
+- the station's playlist is re-read every 2 s and the next three segments are
+  downloaded ahead of ffmpeg, so a slow or refused fetch does not pause it;
+- a refused address is looked up again and the playlist re-read until the
+  station hands out current signatures;
+- if the station's playlist cannot be read, ffmpeg is given the last one that
+  could (for up to 60 s) and carries on with the segments in hand;
+- MP4 segments (Apple's) are handed over as plain AAC: the same audio frames,
+  each given its 7-byte ADTS header. ffmpeg's MP4 reader remembers every frame
+  it has read, so its memory grew about 4 MB an hour for as long as a listener
+  stayed; its plain-AAC reader stays flat.
+
+What it does not cover: a station unreachable for longer than about 25 s still
+pauses the stream, and ffmpeg does not rebuild the listener's head start
+afterwards.
 
 ## Logs
 
